@@ -240,10 +240,8 @@ private:
 	{
 		void *debug_cpu_instruction_hook;
 		void *drcmap_get_value;
-		void *hashstacksave;
 
 		uint32_t emulated_flags;
-		uint32_t calldepth;
 	};
 	near_state &m_near;
 
@@ -261,6 +259,7 @@ private:
 	{
 
 		resolved_handler read_byte;
+		resolved_handler read_byte_masked;
 		resolved_handler read_word;
 		resolved_handler read_word_masked;
 		resolved_handler read_dword;
@@ -269,6 +268,7 @@ private:
 		resolved_handler read_qword_masked;
 
 		resolved_handler write_byte;
+		resolved_handler write_byte_masked;
 		resolved_handler write_word;
 		resolved_handler write_word_masked;
 		resolved_handler write_dword;

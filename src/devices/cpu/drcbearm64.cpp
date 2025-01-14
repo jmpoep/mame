@@ -911,7 +911,7 @@ drcbe_arm64::drcbe_arm64(drcuml_state &drcuml, device_t &device, drc_cache &cach
 	auto const resolve_accessor =
 			[] (resolved_handler &handler, address_space &space, auto accessor)
 			{
-				auto const [entrypoint, adjusted] = util::resolve_member_function(accessor, &space);
+				auto const [entrypoint, adjusted] = util::resolve_member_function(accessor, space);
 				handler.func = reinterpret_cast<uint8_t *>(entrypoint);
 				handler.obj = adjusted;
 			};
@@ -922,6 +922,7 @@ drcbe_arm64::drcbe_arm64(drcuml_state &drcuml, device_t &device, drc_cache &cach
 		if (m_space[space])
 		{
 			resolve_accessor(m_resolved_accessors[space].read_byte,         *m_space[space], static_cast<u8  (address_space::*)(offs_t)     >(&address_space::read_byte));
+			resolve_accessor(m_resolved_accessors[space].read_byte_masked,  *m_space[space], static_cast<u8  (address_space::*)(offs_t, u8) >(&address_space::read_byte));
 			resolve_accessor(m_resolved_accessors[space].read_word,         *m_space[space], static_cast<u16 (address_space::*)(offs_t)     >(&address_space::read_word));
 			resolve_accessor(m_resolved_accessors[space].read_word_masked,  *m_space[space], static_cast<u16 (address_space::*)(offs_t, u16)>(&address_space::read_word));
 			resolve_accessor(m_resolved_accessors[space].read_dword,        *m_space[space], static_cast<u32 (address_space::*)(offs_t)     >(&address_space::read_dword));
@@ -930,6 +931,7 @@ drcbe_arm64::drcbe_arm64(drcuml_state &drcuml, device_t &device, drc_cache &cach
 			resolve_accessor(m_resolved_accessors[space].read_qword_masked, *m_space[space], static_cast<u64 (address_space::*)(offs_t, u64)>(&address_space::read_qword));
 
 			resolve_accessor(m_resolved_accessors[space].write_byte,         *m_space[space], static_cast<void (address_space::*)(offs_t, u8)      >(&address_space::write_byte));
+			resolve_accessor(m_resolved_accessors[space].write_byte_masked,  *m_space[space], static_cast<void (address_space::*)(offs_t, u8, u8)  >(&address_space::write_byte));
 			resolve_accessor(m_resolved_accessors[space].write_word,         *m_space[space], static_cast<void (address_space::*)(offs_t, u16)     >(&address_space::write_word));
 			resolve_accessor(m_resolved_accessors[space].write_word_masked,  *m_space[space], static_cast<void (address_space::*)(offs_t, u16, u16)>(&address_space::write_word));
 			resolve_accessor(m_resolved_accessors[space].write_dword,        *m_space[space], static_cast<void (address_space::*)(offs_t, u32)     >(&address_space::write_dword));
@@ -976,9 +978,6 @@ void drcbe_arm64::reset()
 	CodeHolder ch;
 	ch.init(Environment::host(), uint64_t(dst));
 
-	m_near.calldepth = 0;
-	m_near.hashstacksave = nullptr;
-
 	FileLogger logger(m_log_asmjit);
 	if (logger.file())
 	{
@@ -1013,8 +1012,6 @@ void drcbe_arm64::reset()
 
 	a.ldr(BASE_REG, get_mem_absolute(a, &m_baseptr));
 	emit_ldr_mem(a, FLAGS_REG.w(), &m_near.emulated_flags);
-	emit_str_mem(a, a64::wzr, &m_near.calldepth);
-	emit_str_mem(a, a64::xzr, &m_near.hashstacksave);
 
 	a.emitArgsAssignment(frame, args);
 
@@ -1284,7 +1281,6 @@ void drcbe_arm64::op_hashjmp(a64::Assembler &a, const uml::instruction &inst)
 	const parameter &exp = inst.param(2);
 	assert(exp.is_code_handle());
 
-	emit_str_mem(a, a64::wzr, &m_near.calldepth);
 	a.mov(a64::sp, a64::x29);
 
 	if (modep.is_immediate() && m_hash.is_mode_populated(modep.immediate()))
@@ -1366,10 +1362,6 @@ void drcbe_arm64::op_hashjmp(a64::Assembler &a, const uml::instruction &inst)
 	a.br(TEMP_REG1);
 
 	a.bind(lab);
-	emit_str_mem(a, REG_PARAM1, &m_near.hashstacksave);
-
-	a.mov(SCRATCH_REG1, 1);
-	emit_str_mem(a, SCRATCH_REG1.w(), &m_near.calldepth);
 
 	mov_mem_param(a, 4, &m_state.exp, pcp);
 
@@ -1437,15 +1429,6 @@ void drcbe_arm64::op_exh(a64::Assembler &a, const uml::instruction &inst)
 			a.b(ARM_NOT_CONDITION(a, inst.condition()), no_exception);
 	}
 
-	Label lab = a.newLabel();
-	emit_ldr_mem(a, SCRATCH_REG1.w(), &m_near.calldepth);
-	a.cbnz(SCRATCH_REG1, lab);
-	a.adr(SCRATCH_REG2, lab);
-	emit_str_mem(a, SCRATCH_REG2, &m_near.hashstacksave);
-	a.bind(lab);
-	a.add(SCRATCH_REG1, SCRATCH_REG1, 1);
-	emit_str_mem(a, SCRATCH_REG1.w(), &m_near.calldepth);
-
 	mov_mem_param(a, 4, &m_state.exp, exp);
 
 	drccodeptr *const targetptr = handp.handle().codeptr_addr();
@@ -1486,15 +1469,6 @@ void drcbe_arm64::op_callh(a64::Assembler &a, const uml::instruction &inst)
 			a.b(ARM_NOT_CONDITION(a, inst.condition()), skip);
 	}
 
-	Label lab = a.newLabel();
-	emit_ldr_mem(a, SCRATCH_REG1.w(), &m_near.calldepth);
-	a.cbnz(SCRATCH_REG1, lab);
-	a.adr(SCRATCH_REG2, lab);
-	emit_str_mem(a, SCRATCH_REG2, &m_near.hashstacksave);
-	a.bind(lab);
-	a.add(SCRATCH_REG1, SCRATCH_REG1, 1);
-	emit_str_mem(a, SCRATCH_REG1.w(), &m_near.calldepth);
-
 	drccodeptr *const targetptr = handp.handle().codeptr_addr();
 	if (*targetptr != nullptr)
 	{
@@ -1530,13 +1504,6 @@ void drcbe_arm64::op_ret(a64::Assembler &a, const uml::instruction &inst)
 		else
 			a.b(ARM_NOT_CONDITION(a, inst.condition()), skip);
 	}
-
-	Label lab = a.newLabel();
-	emit_ldr_mem(a, SCRATCH_REG1.w(), &m_near.calldepth);
-	a.cbz(SCRATCH_REG1, lab);
-	a.sub(SCRATCH_REG1, SCRATCH_REG1, 1);
-	emit_str_mem(a, SCRATCH_REG1.w(), &m_near.calldepth);
-	a.bind(lab);
 
 	a.ldp(a64::x29, a64::x30, arm::Mem(a64::sp).post(16));
 	a.ret(a64::x30);
@@ -1590,7 +1557,7 @@ void drcbe_arm64::op_recover(a64::Assembler &a, const uml::instruction &inst)
 	be_parameter dstp(*this, inst.param(0), PTYPE_MR);
 
 	get_imm_relative(a, REG_PARAM1, (uintptr_t)&m_map);
-	emit_ldr_mem(a, REG_PARAM2, &m_near.hashstacksave);
+	a.ldr(REG_PARAM2, arm::Mem(a64::x29, -8)); // saved LR (x30) from first level CALLH/EXH or failed hash jump
 	a.mov(REG_PARAM3, inst.param(1).mapvar());
 
 	emit_ldr_mem(a, TEMP_REG1, &m_near.drcmap_get_value);
@@ -2116,7 +2083,21 @@ void drcbe_arm64::op_readm(a64::Assembler &a, const uml::instruction &inst)
 	mov_reg_param(a, 4, REG_PARAM2, addrp);
 	mov_reg_param(a, inst.size(), REG_PARAM3, maskp);
 
-	if (spacesizep.size() == SIZE_WORD)
+	if (spacesizep.size() == SIZE_BYTE)
+	{
+		if (resolved.read_byte_masked.func)
+		{
+			get_imm_relative(a, REG_PARAM1, resolved.read_byte_masked.obj);
+			call_arm_addr(a, resolved.read_byte_masked.func);
+		}
+		else
+		{
+			get_imm_relative(a, REG_PARAM1, (uintptr_t)m_space[spacesizep.space()]);
+			emit_ldr_mem(a, TEMP_REG1, &trampolines.read_byte_masked);
+			a.blr(TEMP_REG1);
+		}
+	}
+	else if (spacesizep.size() == SIZE_WORD)
 	{
 		if (resolved.read_word_masked.func)
 		{
@@ -2257,7 +2238,21 @@ void drcbe_arm64::op_writem(a64::Assembler &a, const uml::instruction &inst)
 	mov_reg_param(a, inst.size(), REG_PARAM3, srcp);
 	mov_reg_param(a, inst.size(), REG_PARAM4, maskp);
 
-	if (spacesizep.size() == SIZE_WORD)
+	if (spacesizep.size() == SIZE_BYTE)
+	{
+		if (resolved.write_byte_masked.func)
+		{
+			get_imm_relative(a, REG_PARAM1, resolved.write_byte_masked.obj);
+			call_arm_addr(a, resolved.write_byte_masked.func);
+		}
+		else
+		{
+			get_imm_relative(a, REG_PARAM1, (uintptr_t)m_space[spacesizep.space()]);
+			emit_ldr_mem(a, TEMP_REG1, &trampolines.write_byte_masked);
+			a.blr(TEMP_REG1);
+		}
+	}
+	else if (spacesizep.size() == SIZE_WORD)
 	{
 		if (resolved.write_word_masked.func)
 		{

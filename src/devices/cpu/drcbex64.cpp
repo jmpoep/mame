@@ -2,7 +2,7 @@
 // copyright-holders:Aaron Giles
 /***************************************************************************
 
-    drcbex64.c
+    drcbex64.cpp
 
     64-bit x64 back-end for the universal machine language.
 
@@ -158,10 +158,10 @@
         [rsp+48]   - saved r14
         [rsp+56]   - saved r13
         [rsp+64]   - saved r12
-        [rsp+72]   - saved ebp
-        [rsp+80]   - saved edi
-        [rsp+88]   - saved esi
-        [rsp+96]   - saved ebx
+        [rsp+72]   - saved rbp
+        [rsp+80]   - saved rdi
+        [rsp+88]   - saved rsi
+        [rsp+96]   - saved rbx
         [rsp+104]  - ret
 
 ***************************************************************************/
@@ -696,7 +696,7 @@ drcbe_x64::drcbe_x64(drcuml_state &drcuml, device_t &device, drc_cache &cache, u
 	auto const resolve_accessor =
 			[] (resolved_handler &handler, address_space &space, auto accessor)
 			{
-				auto const [entrypoint, adjusted] = util::resolve_member_function(accessor, &space);
+				auto const [entrypoint, adjusted] = util::resolve_member_function(accessor, space);
 				handler.func = reinterpret_cast<x86code *>(entrypoint);
 				handler.obj = adjusted;
 			};
@@ -706,6 +706,7 @@ drcbe_x64::drcbe_x64(drcuml_state &drcuml, device_t &device, drc_cache &cache, u
 		if (m_space[space])
 		{
 			resolve_accessor(m_resolved_accessors[space].read_byte,         *m_space[space], static_cast<u8  (address_space::*)(offs_t)     >(&address_space::read_byte));
+			resolve_accessor(m_resolved_accessors[space].read_byte_masked,  *m_space[space], static_cast<u8  (address_space::*)(offs_t, u8) >(&address_space::read_byte));
 			resolve_accessor(m_resolved_accessors[space].read_word,         *m_space[space], static_cast<u16 (address_space::*)(offs_t)     >(&address_space::read_word));
 			resolve_accessor(m_resolved_accessors[space].read_word_masked,  *m_space[space], static_cast<u16 (address_space::*)(offs_t, u16)>(&address_space::read_word));
 			resolve_accessor(m_resolved_accessors[space].read_dword,        *m_space[space], static_cast<u32 (address_space::*)(offs_t)     >(&address_space::read_dword));
@@ -714,6 +715,7 @@ drcbe_x64::drcbe_x64(drcuml_state &drcuml, device_t &device, drc_cache &cache, u
 			resolve_accessor(m_resolved_accessors[space].read_qword_masked, *m_space[space], static_cast<u64 (address_space::*)(offs_t, u64)>(&address_space::read_qword));
 
 			resolve_accessor(m_resolved_accessors[space].write_byte,         *m_space[space], static_cast<void (address_space::*)(offs_t, u8)      >(&address_space::write_byte));
+			resolve_accessor(m_resolved_accessors[space].write_byte_masked,  *m_space[space], static_cast<void (address_space::*)(offs_t, u8, u8)  >(&address_space::write_byte));
 			resolve_accessor(m_resolved_accessors[space].write_word,         *m_space[space], static_cast<void (address_space::*)(offs_t, u16)     >(&address_space::write_word));
 			resolve_accessor(m_resolved_accessors[space].write_word_masked,  *m_space[space], static_cast<void (address_space::*)(offs_t, u16, u16)>(&address_space::write_word));
 			resolve_accessor(m_resolved_accessors[space].write_dword,        *m_space[space], static_cast<void (address_space::*)(offs_t, u32)     >(&address_space::write_dword));
@@ -837,9 +839,7 @@ void drcbe_x64::reset()
 	a.emitProlog(frame);
 	a.emitArgsAssignment(frame, args);
 
-	a.sub(rsp, 32);
-	a.mov(MABS(&m_near.hashstacksave), rsp);
-	a.sub(rsp, 8);
+	a.sub(rsp, 40);
 	a.mov(MABS(&m_near.stacksave), rsp);
 	a.stmxcsr(MABS(&m_near.ssemode));
 	a.jmp(Gpq(REG_PARAM2));
@@ -848,14 +848,14 @@ void drcbe_x64::reset()
 	m_exit = dst + a.offset();
 	a.bind(a.newNamedLabel("exit_point"));
 	a.ldmxcsr(MABS(&m_near.ssemode));
-	a.mov(rsp, MABS(&m_near.hashstacksave));
-	a.add(rsp, 32);
+	a.mov(rsp, MABS(&m_near.stacksave));
+	a.add(rsp, 40);
 	a.emitEpilog(frame);
 
 	// generate a no code point
 	m_nocode = dst + a.offset();
 	a.bind(a.newNamedLabel("nocode_point"));
-	a.ret();
+	a.jmp(Gpq(REG_PARAM1));
 
 	// emit the generated code
 	size_t bytes = emit(ch);
@@ -1612,30 +1612,32 @@ void drcbe_x64::op_hashjmp(Assembler &a, const instruction &inst)
 		smart_call_m64(a, &m_near.debug_log_hashjmp);
 	}
 
-	// load the stack base one word early so we end up at the right spot after our call below
-	a.mov(rsp, MABS(&m_near.hashstacksave));                                            // mov   rsp,[hashstacksave]
+	// load the stack base
+	Label nocode = a.newLabel();
+	a.mov(rsp, MABS(&m_near.stacksave));                                            // mov   rsp,[stacksave]
 
 	// fixed mode cases
 	if (modep.is_immediate() && m_hash.is_mode_populated(modep.immediate()))
 	{
-		// a straight immediate jump is direct, though we need the PC in EAX in case of failure
 		if (pcp.is_immediate())
 		{
+			// a straight immediate jump is direct, though we need the PC in EAX in case of failure
 			uint32_t l1val = (pcp.immediate() >> m_hash.l1shift()) & m_hash.l1mask();
 			uint32_t l2val = (pcp.immediate() >> m_hash.l2shift()) & m_hash.l2mask();
-			a.call(MABS(&m_hash.base()[modep.immediate()][l1val][l2val]));              // call  hash[modep][l1val][l2val]
+			a.short_().lea(Gpq(REG_PARAM1), ptr(nocode));                               // lea   rcx,[rip+nocode]
+			a.jmp(MABS(&m_hash.base()[modep.immediate()][l1val][l2val]));               // jmp   hash[modep][l1val][l2val]
 		}
-
-		// a fixed mode but variable PC
 		else
 		{
+			// a fixed mode but variable PC
 			mov_reg_param(a, eax, pcp);                                                 // mov   eax,pcp
 			a.mov(edx, eax);                                                            // mov   edx,eax
 			a.shr(edx, m_hash.l1shift());                                               // shr   edx,l1shift
 			a.and_(eax, m_hash.l2mask() << m_hash.l2shift());                           // and  eax,l2mask << l2shift
 			a.mov(rdx, ptr(rbp, rdx, 3, offset_from_rbp(&m_hash.base()[modep.immediate()][0])));
 																						// mov   rdx,hash[modep+edx*8]
-			a.call(ptr(rdx, rax, 3 - m_hash.l2shift()));                                // call  [rdx+rax*shift]
+			a.short_().lea(Gpq(REG_PARAM1), ptr(nocode));                               // lea   rcx,[rip+nocode]
+			a.jmp(ptr(rdx, rax, 3 - m_hash.l2shift()));                                 // jmp   [rdx+rax*shift]
 		}
 	}
 	else
@@ -1645,31 +1647,30 @@ void drcbe_x64::op_hashjmp(Assembler &a, const instruction &inst)
 		mov_reg_param(a, modereg, modep);                                               // mov   modereg,modep
 		a.mov(rcx, ptr(rbp, modereg, 3, offset_from_rbp(m_hash.base())));               // mov   rcx,hash[modereg*8]
 
-		// fixed PC
 		if (pcp.is_immediate())
 		{
+			// fixed PC
 			uint32_t l1val = (pcp.immediate() >> m_hash.l1shift()) & m_hash.l1mask();
 			uint32_t l2val = (pcp.immediate() >> m_hash.l2shift()) & m_hash.l2mask();
 			a.mov(rdx, ptr(rcx, l1val * 8));                                            // mov   rdx,[rcx+l1val*8]
-			a.call(ptr(rdx, l2val * 8));                                                // call  [l2val*8]
+			a.short_().lea(Gpq(REG_PARAM1), ptr(nocode));                               // lea   rcx,[rip+nocode]
+			a.jmp(ptr(rdx, l2val * 8));                                                 // jmp   [l2val*8]
 		}
-
-		// variable PC
 		else
 		{
+			// variable PC
 			mov_reg_param(a, eax, pcp);                                                 // mov   eax,pcp
 			a.mov(edx, eax);                                                            // mov   edx,eax
 			a.shr(edx, m_hash.l1shift());                                               // shr   edx,l1shift
 			a.mov(rdx, ptr(rcx, rdx, 3));                                               // mov   rdx,[rcx+rdx*8]
 			a.and_(eax, m_hash.l2mask() << m_hash.l2shift());                           // and   eax,l2mask << l2shift
-			a.call(ptr(rdx, rax, 3 - m_hash.l2shift()));                                // call  [rdx+rax*shift]
+			a.short_().lea(Gpq(REG_PARAM1), ptr(nocode));                               // lea   rcx,[rip+nocode]
+			a.jmp(ptr(rdx, rax, 3 - m_hash.l2shift()));                                 // jmp   [rdx+rax*shift]
 		}
 	}
 
-	// fix stack alignment if "no code" landing returned from abuse of call with misaligned stack
-	a.sub(rsp, 8);                                                                      // sub   rsp,8
-
 	// in all cases, if there is no code, we return here to generate the exception
+	a.bind(nocode);
 	if (LOG_HASHJMPS)
 		smart_call_m64(a, &m_near.debug_log_hashjmp_fail);
 
@@ -2616,12 +2617,26 @@ void drcbe_x64::op_readm(Assembler &a, const instruction &inst)
 		mov_reg_param(a, Gpd(REG_PARAM3), maskp);                                       // mov    param3,maskp
 	else
 		mov_reg_param(a, Gpq(REG_PARAM3), maskp);                                       // mov    param3,maskp
-	if (spacesizep.size() == SIZE_WORD)
+	if (spacesizep.size() == SIZE_BYTE)
+	{
+		if (resolved.read_byte_masked.func)
+		{
+			mov_r64_imm(a, Gpq(REG_PARAM1), resolved.read_byte_masked.obj);             // mov    param1,space
+			smart_call_r64(a, resolved.read_byte_masked.func, rax);                     // call   read_byte_masked
+		}
+		else
+		{
+			mov_r64_imm(a, Gpq(REG_PARAM1), (uintptr_t)m_space[spacesizep.space()]);    // mov    param1,space
+			smart_call_m64(a, (x86code **)&trampolines.read_byte_masked);               // call   read_byte_masked
+		}
+		a.movzx(dstreg, al);                                                            // movzx  dstreg,al
+	}
+	else if (spacesizep.size() == SIZE_WORD)
 	{
 		if (resolved.read_word_masked.func)
 		{
 			mov_r64_imm(a, Gpq(REG_PARAM1), resolved.read_word_masked.obj);             // mov    param1,space
-			smart_call_r64(a, resolved.read_word_masked.func, rax);                     // call   read_byte_masked
+			smart_call_r64(a, resolved.read_word_masked.func, rax);                     // call   read_word_masked
 		}
 		else
 		{
@@ -2781,7 +2796,20 @@ void drcbe_x64::op_writem(Assembler &a, const instruction &inst)
 		mov_reg_param(a, Gpq(REG_PARAM3), srcp);                                        // mov    param3,srcp
 		mov_reg_param(a, Gpq(REG_PARAM4), maskp);                                       // mov    param4,maskp
 	}
-	if (spacesizep.size() == SIZE_WORD)
+	if (spacesizep.size() == SIZE_BYTE)
+	{
+		if (resolved.write_byte.func)
+		{
+			mov_r64_imm(a, Gpq(REG_PARAM1), resolved.write_byte_masked.obj);            // mov    param1,space
+			smart_call_r64(a, resolved.write_byte_masked.func, rax);                    // call   write_byte_masked
+		}
+		else
+		{
+			mov_r64_imm(a, Gpq(REG_PARAM1), (uintptr_t)m_space[spacesizep.space()]);    // mov    param1,space
+			smart_call_m64(a, (x86code **)&trampolines.write_byte_masked);              // call   write_byte_masked
+		}
+	}
+	else if (spacesizep.size() == SIZE_WORD)
 	{
 		if (resolved.write_word.func)
 		{
